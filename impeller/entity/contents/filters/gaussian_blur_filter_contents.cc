@@ -703,7 +703,7 @@ std::optional<Rect> GaussianBlurFilterContents::GetFilterCoverage(
 // 4) Perform 1D vertical blur pass.
 // 5) Apply the blur style to the blur result. This may just mask the output or
 //    draw the original snapshot over the result.
-std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
+std::optional<Entity> GaussianBlurFilterContents::RenderFilterGradientMask(
     const FilterInput::Vector& inputs,
     const ContentContext& renderer,
     const Entity& entity,
@@ -837,32 +837,87 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
     return std::nullopt;
   }
 
+  // ---------------------------------------------------------
+  // PASS 4: GRADIENT MIX PASS (Custom)
+  // ---------------------------------------------------------
+  std::shared_ptr<CommandBuffer> command_buffer_4 =
+      renderer.GetContext()->CreateCommandBuffer();
+  if (!command_buffer_4) {
+    return std::nullopt;
+  }
+
+  // We create a helper lambda just like MakeBlurSubpass does
+  ContentContext::SubpassCallback mix_subpass_callback =
+      [&](const ContentContext& renderer, RenderPass& pass) {
+        
+        // 1. Setup your new Gradient Mix Shader Pipeline here
+        // (You will need to define GradientMixPipeline using the .frag you wrote)
+        ContentContextOptions options = OptionsFromPass(pass);
+        options.primitive_type = PrimitiveType::kTriangleStrip;
+        // pass.SetPipeline(renderer.GetGradientMixPipeline(options)); 
+        
+        HostBuffer& host_buffer = renderer.GetTransientsBuffer();
+
+        // 2. Bind the geometry (a simple full-screen quad)
+        std::array<GaussianBlurVertexShader::PerVertexData, 4> vertices = {
+            GaussianBlurVertexShader::PerVertexData{blur_uvs[0], blur_uvs[0]},
+            GaussianBlurVertexShader::PerVertexData{blur_uvs[1], blur_uvs[1]},
+            GaussianBlurVertexShader::PerVertexData{blur_uvs[2], blur_uvs[2]},
+            GaussianBlurVertexShader::PerVertexData{blur_uvs[3], blur_uvs[3]},
+        };
+        pass.SetVertexBuffer(CreateVertexBuffer(vertices, host_buffer));
+
+        // 3. Feed BOTH textures to the GPU
+        // Texture A: The crisp original snapshot
+        // Texture B: The fully blurred result from Pass 3
+        /*
+        GradientMixFragmentShader::BindOriginalTexture(
+            pass, input_snapshot->texture, ...);
+        GradientMixFragmentShader::BindBlurredTexture(
+            pass, pass3_out.value().GetRenderTargetTexture(), ...);
+        */
+
+        return pass.Draw().ok();
+      };
+
+  // Execute the mix pass into a new RenderTarget (pass4_out)
+  fml::StatusOr<RenderTarget> pass4_out = renderer.MakeSubpass(
+      "Gradient Mix Filter", pass3_out.value().GetRenderTargetSize(),
+      command_buffer_4, mix_subpass_callback);
+
+  if (!pass4_out.ok()) {
+    return std::nullopt;
+  }
+  // ---------------------------------------------------------
+
   if (!(renderer.GetContext()->EnqueueCommandBuffer(
             std::move(command_buffer_1)) &&
         renderer.GetContext()->EnqueueCommandBuffer(
             std::move(command_buffer_2)) &&
         renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_3)))) {
+            std::move(command_buffer_3)) &&
+        renderer.GetContext()->EnqueueCommandBuffer( // <- NEW
+            std::move(command_buffer_4)))) {         // <- NEW
     return std::nullopt;
   }
 
-  // The ping-pong approach requires that each render pass output has the same
-  // size.
   FML_DCHECK((pass1_out.value().GetRenderTargetSize() ==
               pass2_out.value().GetRenderTargetSize()) &&
              (pass2_out.value().GetRenderTargetSize() ==
-              pass3_out.value().GetRenderTargetSize()));
-
+              pass3_out.value().GetRenderTargetSize()) &&
+             (pass3_out.value().GetRenderTargetSize() ==         // <- NEW
+              pass4_out.value().GetRenderTargetSize()));         // <- NEW
   SamplerDescriptor sampler_desc = MakeSamplerDescriptor(
       MinMagFilter::kLinear, SamplerAddressMode::kClampToEdge);
 
+  // CHANGE texture FROM pass3_out TO pass4_out
   Entity blur_output_entity = Entity::FromSnapshot(
-      Snapshot{.texture = pass3_out.value().GetRenderTargetTexture(),
+      Snapshot{.texture = pass4_out.value().GetRenderTargetTexture(), // <- CHANGED
                .transform =
-                   entity.GetTransform() *                                   //
-                   Matrix::MakeScale(1.f / blur_info.source_space_scalar) *  //
+                   entity.GetTransform() * //
+                   Matrix::MakeScale(1.f / blur_info.source_space_scalar) * //
                    Matrix::MakeTranslation(-1 * blur_info.source_space_offset) *
-                   downsample_pass_args.transform *  //
+                   downsample_pass_args.transform * //
                    Matrix::MakeScale(1 / downsample_pass_args.effective_scalar),
                .sampler_descriptor = sampler_desc,
                .opacity = input_snapshot->opacity},
