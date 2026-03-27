@@ -695,6 +695,180 @@ std::optional<Rect> GaussianBlurFilterContents::GetFilterCoverage(
       Point(blur_info.local_padding.x, blur_info.local_padding.y));
 }
 
+
+std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
+    const FilterInput::Vector& inputs,
+    const ContentContext& renderer,
+    const Entity& entity,
+    const Matrix& effect_transform,
+    const Rect& coverage,
+    const std::optional<Rect>& coverage_hint) const {
+  if (inputs.empty()) {
+    return std::nullopt;
+  }
+
+  BlurInfo blur_info = CalculateBlurInfo(entity, effect_transform, sigma_);
+
+  // Apply as much of the desired padding as possible from the source. This may
+  // be ignored so must be accounted for in the downsample pass by adding a
+  // transparent gutter.
+  std::optional<Rect> expanded_coverage_hint;
+  if (coverage_hint.has_value()) {
+    expanded_coverage_hint = coverage_hint->Expand(blur_info.local_padding);
+  }
+
+  Entity snapshot_entity = entity.Clone();
+  snapshot_entity.SetTransform(
+      Matrix::MakeTranslation(blur_info.source_space_offset) *
+      Matrix::MakeScale(blur_info.source_space_scalar));
+
+  std::optional<Rect> source_expanded_coverage_hint;
+  if (expanded_coverage_hint.has_value()) {
+    source_expanded_coverage_hint = expanded_coverage_hint->TransformBounds(
+        Matrix::MakeTranslation(blur_info.source_space_offset) *
+        Matrix::MakeScale(blur_info.source_space_scalar) *
+        entity.GetTransform().Invert());
+  }
+
+  std::optional<Snapshot> input_snapshot = GetSnapshot(
+      inputs[0], renderer, snapshot_entity, source_expanded_coverage_hint);
+  if (!input_snapshot.has_value()) {
+    return std::nullopt;
+  }
+
+  if (blur_info.scaled_sigma.x < kEhCloseEnough &&
+      blur_info.scaled_sigma.y < kEhCloseEnough) {
+    Entity result =
+        Entity::FromSnapshot(input_snapshot.value(),
+                             entity.GetBlendMode());  // No blur to render.
+    result.SetTransform(
+        entity.GetTransform() *
+        Matrix::MakeScale(1.f / blur_info.source_space_scalar) *
+        Matrix::MakeTranslation(-1 * blur_info.source_space_offset) *
+        input_snapshot->transform);
+    return result;
+  }
+
+  // Note: The code below uses three different command buffers when it would be
+  // possible to combine the operations into a single buffer. From testing and
+  // user bug reports (see https://github.com/flutter/flutter/issues/154046 ),
+  // this sometimes causes deviceLost errors on older Adreno devices. Breaking
+  // the work up into three different command buffers seems to prevent this
+  // crash.
+  std::shared_ptr<CommandBuffer> command_buffer_1 =
+      renderer.GetContext()->CreateCommandBuffer();
+  if (!command_buffer_1) {
+    return std::nullopt;
+  }
+
+  DownsamplePassArgs downsample_pass_args = CalculateDownsamplePassArgs(
+      blur_info.scaled_sigma, blur_info.padding, input_snapshot.value(),
+      source_expanded_coverage_hint, inputs[0], snapshot_entity);
+
+  fml::StatusOr<RenderTarget> pass1_out = MakeDownsampleSubpass(
+      renderer, command_buffer_1, input_snapshot->texture,
+      input_snapshot->sampler_descriptor, downsample_pass_args, tile_mode_);
+
+  if (!pass1_out.ok()) {
+    return std::nullopt;
+  }
+
+  Vector2 pass1_pixel_size =
+      1.0 / Vector2(pass1_out.value().GetRenderTargetTexture()->GetSize());
+
+  Quad blur_uvs = {Point(0, 0), Point(1, 0), Point(0, 1), Point(1, 1)};
+
+  std::shared_ptr<CommandBuffer> command_buffer_2 =
+      renderer.GetContext()->CreateCommandBuffer();
+  if (!command_buffer_2) {
+    return std::nullopt;
+  }
+
+  fml::StatusOr<RenderTarget> pass2_out = MakeBlurSubpass(
+      renderer, command_buffer_2, /*input_pass=*/pass1_out.value(),
+      input_snapshot->sampler_descriptor, tile_mode_,
+      BlurParameters{
+          .blur_uv_offset = Point(0.0, pass1_pixel_size.y),
+          .blur_sigma = blur_info.scaled_sigma.y *
+                        downsample_pass_args.effective_scalar.y,
+          .blur_radius = ScaleBlurRadius(
+              blur_info.blur_radius.y, downsample_pass_args.effective_scalar.y),
+          .step_size = 1,
+      },
+      /*destination_target=*/std::nullopt, blur_uvs);
+
+  if (!pass2_out.ok()) {
+    return std::nullopt;
+  }
+
+  std::shared_ptr<CommandBuffer> command_buffer_3 =
+      renderer.GetContext()->CreateCommandBuffer();
+  if (!command_buffer_3) {
+    return std::nullopt;
+  }
+
+  // Only ping pong if the first pass actually created a render target.
+  auto pass3_destination = pass2_out.value().GetRenderTargetTexture() !=
+                                   pass1_out.value().GetRenderTargetTexture()
+                               ? std::optional<RenderTarget>(pass1_out.value())
+                               : std::optional<RenderTarget>(std::nullopt);
+
+  fml::StatusOr<RenderTarget> pass3_out = MakeBlurSubpass(
+      renderer, command_buffer_3, /*input_pass=*/pass2_out.value(),
+      input_snapshot->sampler_descriptor, tile_mode_,
+      BlurParameters{
+          .blur_uv_offset = Point(pass1_pixel_size.x, 0.0),
+          .blur_sigma = blur_info.scaled_sigma.x *
+                        downsample_pass_args.effective_scalar.x,
+          .blur_radius = ScaleBlurRadius(
+              blur_info.blur_radius.x, downsample_pass_args.effective_scalar.x),
+          .step_size = 1,
+      },
+      pass3_destination, blur_uvs);
+
+  if (!pass3_out.ok()) {
+    return std::nullopt;
+  }
+
+  if (!(renderer.GetContext()->EnqueueCommandBuffer(
+            std::move(command_buffer_1)) &&
+        renderer.GetContext()->EnqueueCommandBuffer(
+            std::move(command_buffer_2)) &&
+        renderer.GetContext()->EnqueueCommandBuffer(
+            std::move(command_buffer_3)))) {
+    return std::nullopt;
+  }
+
+  // The ping-pong approach requires that each render pass output has the same
+  // size.
+  FML_DCHECK((pass1_out.value().GetRenderTargetSize() ==
+              pass2_out.value().GetRenderTargetSize()) &&
+             (pass2_out.value().GetRenderTargetSize() ==
+              pass3_out.value().GetRenderTargetSize()));
+
+  SamplerDescriptor sampler_desc = MakeSamplerDescriptor(
+      MinMagFilter::kLinear, SamplerAddressMode::kClampToEdge);
+
+  Entity blur_output_entity = Entity::FromSnapshot(
+      Snapshot{.texture = pass3_out.value().GetRenderTargetTexture(),
+               .transform =
+                   entity.GetTransform() *                                   //
+                   Matrix::MakeScale(1.f / blur_info.source_space_scalar) *  //
+                   Matrix::MakeTranslation(-1 * blur_info.source_space_offset) *
+                   downsample_pass_args.transform *  //
+                   Matrix::MakeScale(1 / downsample_pass_args.effective_scalar),
+               .sampler_descriptor = sampler_desc,
+               .opacity = input_snapshot->opacity},
+      entity.GetBlendMode());
+
+  return ApplyBlurStyle(mask_blur_style_, entity, inputs[0],
+                        input_snapshot.value(), std::move(blur_output_entity),
+                        mask_geometry_, blur_info.source_space_scalar,
+                        blur_info.source_space_offset);
+}
+
+
+
 // A brief overview how this works:
 // 1) Snapshot the filter input.
 // 2) Perform downsample pass. This also inserts the gutter around the input
@@ -703,6 +877,7 @@ std::optional<Rect> GaussianBlurFilterContents::GetFilterCoverage(
 // 4) Perform 1D vertical blur pass.
 // 5) Apply the blur style to the blur result. This may just mask the output or
 //    draw the original snapshot over the result.
+// 6) Apply gradient mask
 std::optional<Entity> GaussianBlurFilterContents::RenderFilterGradientMask(
     const FilterInput::Vector& inputs,
     const ContentContext& renderer,
